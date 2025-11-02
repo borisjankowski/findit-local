@@ -164,6 +164,18 @@ def get_conn():
         return None
 
 
+def ensure_image_captions_column(cur: sqlite3.Cursor) -> None:
+    """Sorgt dafür, dass die Spalte 'captions' in image_embeds existiert."""
+    try:
+        info = cur.execute("PRAGMA table_info(image_embeds)").fetchall()
+        existing_columns = {row[1] for row in info}
+        if "captions" not in existing_columns:
+            cur.execute("ALTER TABLE image_embeds ADD COLUMN captions TEXT")
+            cur.connection.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Fehler beim Prüfen/Hinzufügen der captions-Spalte: {e}")
+
+
 def init_db():
     try:
         conn = get_conn()
@@ -191,6 +203,7 @@ def init_db():
                 date_taken INTEGER
             );
         """)
+        ensure_image_captions_column(cur)
         conn.commit()
         conn.close()
     except Exception as e:
@@ -367,6 +380,12 @@ def load_model():
         return None
 
 
+def compute_image_score(clip_score: float, caption_score: float, path_score: float) -> float:
+    """Berechnet den finalen Score eines Bildes aus den Teil-Scores."""
+    # Aktuell simple Gewichtung, kann später erweitert werden.
+    return (0.7 * clip_score) + (0.2 * path_score) + (0.1 * caption_score)
+
+
 def extract_exif_date(img: Image.Image, fallback: int) -> int:
     try:
         exif = img.getexif()
@@ -475,12 +494,13 @@ def index_images_batch(photo_dirs, batch_size: int = 32, force_reindex: bool = F
 
                             blob = embedding.tobytes()
                             cur.execute(
-                                """REPLACE INTO image_embeds(path, vector, mtime, width, height, file_size, date_taken) 
-                                   VALUES (?,?,?,?,?,?,?)""",
+                                """REPLACE INTO image_embeds(path, vector, mtime, width, height, file_size, date_taken, captions) 
+                                   VALUES (?,?,?,?,?,?,?,?)""",
                                 (
                                     str(path), blob, meta['mtime'],
                                     meta['width'], meta['height'],
-                                    meta['file_size'], meta['date_taken']
+                                    meta['file_size'], meta['date_taken'],
+                                    None
                                 )
                             )
                             stats['indexed'] += 1
@@ -519,9 +539,13 @@ def search_images(query: str, top_k: int = 50, min_score: float = 0.20, base_fil
     if not conn:
         return []
 
+    cur = conn.cursor()
     try:
-        rows = list(conn.execute("SELECT path, vector, date_taken FROM image_embeds"))
-    except:
+        rows = list(cur.execute("SELECT path, vector, date_taken, captions FROM image_embeds"))
+    except sqlite3.OperationalError:
+        ensure_image_captions_column(cur)
+        rows = list(cur.execute("SELECT path, vector, date_taken, captions FROM image_embeds"))
+    except Exception:
         conn.close()
         return []
 
@@ -546,9 +570,9 @@ def search_images(query: str, top_k: int = 50, min_score: float = 0.20, base_fil
         return []
 
     # 2) Alle Bild-Embeddings laden
-    paths, embeddings, dates = [], [], []
+    paths, embeddings, dates, captions = [], [], [], []
     base_filter = base_filter.strip().lower()
-    for path, blob, date_taken in rows:
+    for path, blob, date_taken, caption_text in rows:
         # optionaler Ordnerfilter
         if base_filter and base_filter not in path.lower():
             continue
@@ -560,6 +584,7 @@ def search_images(query: str, top_k: int = 50, min_score: float = 0.20, base_fil
             embeddings.append(vec)
             paths.append(path)
             dates.append(date_taken or 0)
+            captions.append(caption_text or "")
         except:
             continue
 
@@ -592,7 +617,12 @@ def search_images(query: str, top_k: int = 50, min_score: float = 0.20, base_fil
             # sehr schwach → trotzdem zulassen, aber der final score wird niedrig
             pass
         fscore = filename_score(query, p)
-        final_score = 0.7 * cscore + 0.3 * fscore
+        caption_text = captions[i]
+        caption_score = 0.0
+        if caption_text:
+            caption_score = SequenceMatcher(None, query.lower(), caption_text.lower()).ratio()
+
+        final_score = compute_image_score(cscore, caption_score, fscore)
         if final_score >= min_score * 0.6:  # etwas großzügiger als reiner CLIP
             combined.append((p, final_score))
 
